@@ -1,0 +1,64 @@
+name: avail - no color parameter test
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/no-color-test.yml
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install selenium
+      - name: Open product without colorId once
+        run: |
+          python - <<'PY'
+          import json
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from urllib.parse import urlsplit
+          from connection_test import collect_offers
+          url = "https://www.bershka.com/tr/c0p243093353.html"
+          options = Options()
+          options.add_argument("--headless=new")
+          options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+          driver = webdriver.Chrome(options=options)
+          driver.set_page_load_timeout(40)
+          try:
+              driver.get(url)
+              print("Requested:", url, flush=True)
+              print("Final:", driver.current_url, "Title:", driver.title, flush=True)
+              statuses = []
+              for entry in driver.get_log("performance"):
+                  event = json.loads(entry["message"])["message"]
+                  if event.get("method") == "Network.responseReceived":
+                      p = event["params"]
+                      if p.get("type") == "Document":
+                          statuses.append((p["response"]["url"], p["response"]["status"]))
+              print("Document responses:", statuses, flush=True)
+              body = driver.find_element(By.TAG_NAME, "body").text[:3000].casefold()
+              if any(code in (401, 403, 429) for _, code in statuses) or any(term in body + driver.title.casefold() for term in ("access denied", "request blocked", "forbidden", "too many requests", "captcha")):
+                  raise SystemExit("Access restricted; no further requests.")
+              final = urlsplit(driver.current_url)
+              if final.hostname != "www.bershka.com" or not final.path.startswith("/tr/") or not final.path.endswith("p243093353.html"):
+                  raise SystemExit("Unexpected product page.")
+              WebDriverWait(driver, 20).until(lambda d: d.find_elements(By.CSS_SELECTOR, "button.size-button .size-button__label"))
+              labels = [x.text for x in driver.find_elements(By.CSS_SELECTOR, "button.size-button .size-button__label")]
+              offers = collect_offers([s.get_attribute("textContent") for s in driver.find_elements(By.CSS_SELECTOR, 'script[type="application/ld+json"]')])
+              print("Size labels:", labels, "Offer count:", len(offers), flush=True)
+              if not labels or not offers:
+                  raise SystemExit("Product data not verified.")
+          finally:
+              driver.quit()
+          PY
