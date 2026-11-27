@@ -238,3 +238,212 @@ class Bot:
                 selected={norm(x) for x in value.split(',')}
                 matched=[r for r in d['source_rows'] if norm(r['color']) in selected]
                 links={r['url'] for r in matched}
+                if len(links)!=1: return self.options(chat,user,step,d)
+                d['url']=next(iter(links))
+                d['choices_size']=list(dict.fromkeys(r['size'] for r in matched))[:24]
+                if len(d['choices_size'])==1 and norm(d['choices_size'][0]) in ('tek beden','one size'):
+                    return self.finish_pick(chat,user,'size',d,d['choices_size'][0])
+            self.db.draft(user,'size',d); return self.options(chat,user,'size',d)
+        d['size']=value
+        try: i=self.db.add(d)
+        except sqlite3.IntegrityError:
+            return self.render(chat,'Bu ürün zaten kayıtlı.',keyboard([button('Takip listesi','list:0')],home()))
+        if d.get('source_rows'):
+            from monitor import record
+            now=d.get('observed_at',int(time.time()))
+            if record(self.db,self.db.product(i),[r for r in d['source_rows'] if r['url']==d['url']],now):
+                with self.db.c: self.db.c.execute('INSERT OR REPLACE INTO check_state VALUES(?,?,?,?,?)',(i,now,now+MIN_INTERVAL,'Veri alındı',0))
+        self.db.clear(user);return self.menu(chat,'Ürün listeye eklendi.')
+    def begin(self,chat,user):
+        self.db.draft(user,'url',{});self.render(chat,'Yeni ürün\n\nÜrün bağlantısını gönder.',keyboard([button('Vazgeç','home')]))
+    def callback(self,chat,user,data):
+        a=data.split(':'); cmd=a[0]
+        if cmd=='home': self.db.clear(user);return self.menu(chat)
+        if cmd=='add': return self.begin(chat,user)
+        if cmd in ('retrylink','manualadd'):
+            step,d=self.db.draft(user)
+            if step!='unverified': return self.menu(chat)
+            if cmd=='retrylink':
+                self.db.draft(user,'url',{})
+                return self.message(chat,user,d['url'],fresh=False)
+            self.db.draft(user,'color',d);return self.options(chat,user,'color',d)
+        if cmd in ('pick','pickdone'):
+            step,d=self.db.draft(user)
+            if step not in ('color','size') or step!=a[1]: return
+            choices=d.get('choices_'+step) or []
+            picked=d.get('picked',[])
+            if cmd=='pick':
+                value=choices[int(a[2])]; picked=([value] if value not in picked else []) if step=='color' else ([x for x in picked if x!=value] if value in picked else picked+[value])
+                d['picked']=picked; self.db.draft(user,step,d); return self.options(chat,user,step,d)
+            if picked: return self.finish_pick(chat,user,step,d,', '.join(picked))
+            return self.options(chat,user,step,d)
+        self.db.clear(user)
+        if cmd=='list': return self.listing(chat,int(a[1]))
+        if cmd=='filters': return self.filters(chat)
+        if cmd=='filter':
+            choice=a[1] if len(a)==2 else 'all'
+            self.db.put('list_store',choice if choice in supported_stores(self.db) else '')
+            return self.listing(chat,0)
+        if cmd=='settings':
+            return self.render(chat,'Ayarlar',keyboard([button('Bildirim testi','test')],[button('Desteklenen mağazalar','stores')],[button('Bağlantı testi','probe')],[button('Canlı takibi kapat','disable')] if self.db.get('monitor_enabled')=='1' else [button('Takip listesi','list:0')],home()))
+        if cmd=='disable':
+            self.db.put('monitor_enabled','0');return self.render(chat,'Canlı takip kapalı.',keyboard(home()))
+        if cmd=='probe':
+            self.db.draft(user,'probe',{}); return self.render(chat,'Bağlantı testi\n\nBershka ürün bağlantısını gönder.',keyboard(home()))
+        if cmd=='stores': return self.stores(chat)
+        if cmd=='test':
+            self.tg.send(chat,'Bildirim testi\n\nBildirimler çalışıyor.',{'inline_keyboard':[]}); return self.render(chat,'Ayarlar\n\nTest bildirimi gönderildi.',keyboard([button('Bildirim testi','test')],[button('Desteklenen mağazalar','stores')],[button('Bağlantı testi','probe')],home()))
+        if cmd=='events':
+            lines=[time.strftime('%d.%m.%Y %H:%M',time.gmtime(r['created']+10800))+' — '+r['body'] for r in self.db.events()]
+            return self.render(chat,'Son bildirimler\n\n'+('\n'.join(lines)[:3500] or 'Henüz bildirim yok.'),keyboard(home()))
+        if cmd not in ('p','edit','hist','field','toggle','del','yesdel','check','enable'): return
+        i=int(a[1]); p=self.db.product(i)
+        if not p: return self.listing(chat,0)
+        if cmd=='p': return self.detail(chat,i)
+        if cmd=='edit': return self.edit(chat,i)
+        if cmd=='hist':
+            rows=self.db.c.execute('SELECT * FROM prices WHERE product_id=? ORDER BY observed DESC,id DESC LIMIT 15',(i,)).fetchall()
+            text='Fiyat geçmişi\n\n'+('\n'.join(time.strftime('%d.%m %H:%M',time.gmtime(r['observed']+10800))+' · '+r['variant_key']+' · '+money(r['amount_minor']) for r in rows) or 'Henüz doğrulanmış fiyat kaydı yok.')
+            return self.render(chat,text,keyboard([button('Geri',f'p:{i}')],home()))
+        if cmd=='check':
+            if p['store']!='Bershka' or p['paused']: return self.detail(chat,i)
+            now=int(time.time())
+            if now<max(int(self.db.get('store_pause_until','0')),int(self.db.get('next_store_request','0'))):
+                return self.render(chat,'Kontrol için biraz sonra tekrar dene.',keyboard([button('Geri',f'p:{i}')],home()))
+            self.db.put('next_store_request',now+MIN_INTERVAL)
+            result=self.engine.check_one(p,now)
+            if result=='Veri alındı' and p['store'] in supported_stores(self.db) and self.db.get('monitor_enabled')!='1' and not self.engine.source.pilot.selected():
+                return self.render(chat,'Ürün verisi alındı.\n\nMağaza koşulları otomatik takibe izin veriyorsa takibi etkinleştir.',keyboard([button('Takibi etkinleştir',f'enable:{i}')],[button('Geri',f'p:{i}')],home()))
+            return self.detail(chat,i)
+        if cmd=='enable':
+            state=self.db.c.execute('SELECT status FROM check_state WHERE product_id=?',(i,)).fetchone()
+            if p['store'] in supported_stores(self.db) and state and state[0]=='Veri alındı' and not self.engine.source.pilot.selected():
+                self.db.put('monitor_enabled','1')
+            return self.detail(chat,i)
+        if cmd=='field' and a[2] in ('name','color','size'):
+            if a[2]=='color' and p['store']=='Bershka':
+                return self.render(chat,'Renk değiştirmek için yeni renk bağlantısını gönder.',keyboard([button('Geri',f'p:{i}')],home()))
+            if a[2] in ('color','size'):
+                d={'edit_id':i,'picked':p[a[2]].split(', ')};self.db.draft(user,a[2],d);return self.options(chat,user,a[2],d)
+            self.db.draft(user,'edit',{'id':i,'field':a[2]});return self.render(chat,'Ürün adı\n\nYeni adı yaz.',keyboard([button('Vazgeç',f'p:{i}')]))
+        if cmd=='toggle' and a[2] in ('stock','price','paused'):
+            self.db.update(i,a[2],1-p[a[2]]);
+            if a[2] in ('stock','price') and p[a[2]]:
+                with self.db.c: self.db.c.execute('DELETE FROM outbox WHERE product_id=?',(i,))
+            if a[2]=='paused':
+                with self.db.c:
+                    self.db.c.execute('DELETE FROM confirmed_state WHERE product_id=?',(i,)); self.db.c.execute('DELETE FROM variant_state WHERE product_id=?',(i,)); self.db.c.execute('DELETE FROM check_state WHERE product_id=?',(i,)); self.db.c.execute('DELETE FROM outbox WHERE product_id=?',(i,))
+            return self.detail(chat,i) if a[2]=='paused' else self.edit(chat,i)
+        if cmd=='del': return self.render(chat,'Ürün takip listesinden silinsin mi?',keyboard([button('Evet, sil',f'yesdel:{i}'),button('Vazgeç',f'p:{i}')],home()))
+        if cmd=='yesdel': self.db.delete(i);return self.listing(chat,0)
+    def message(self,chat,user,text,fresh=True):
+        if fresh: self.fresh_screen(chat)
+        if text in ('/start','/menu'):
+            self.db.clear(user)
+            return self.menu(chat)
+        if text=='/iptal': self.db.clear(user);return self.menu(chat)
+        if text=='/ekle': return self.begin(chat,user)
+        if text=='/urunler': return self.listing(chat,0)
+        step,d=self.db.draft(user)
+        try:
+            if step=='probe':
+                url,store=product_url(text)
+                if store!='Bershka': raise ValueError('Bershka ürün bağlantısı gerekli.')
+                identity(url)
+                self.db.clear(user)
+                return self.render(chat,'Bağlantı testi\n\n'+probe(url),keyboard([button('Tekrar test et','probe')],home()))
+            if step=='edit' and 'https://' not in text:
+                value=clean(text) if d['field']=='name' else split_values(text); self.db.update(d['id'],d['field'],value);
+                if d['field'] in ('color','size'): reset(self.db,d['id'])
+                self.db.clear(user); return self.detail(chat,d['id'])
+            if step=='url' or 'https://' in text:
+                url,store=product_url(text); d={'url':url,'store':store}
+                title=text.split('https://',1)[0].strip().rstrip(' -–—')
+                if title.lower().endswith(' - '+store.lower()): title=title[:-(len(store)+3)].strip()
+                # One user-requested lookup, independently of scheduled monitoring.
+                if store=='Bershka':
+                    now=int(time.time())
+                    try: identity(url); valid_link=True
+                    except ValueError: valid_link=False
+                    if valid_link and now>=max(int(self.db.get('next_store_request','0')),int(self.db.get('store_pause_until','0'))):
+                        self.db.put('next_store_request',now+MIN_INTERVAL)
+                        try:
+                            rows=self.engine.source.discover(url)
+                            if rows and len(rows)<=100:
+                                d['source_rows']=rows; d['observed_at']=int(time.time()); d['name']=clean(rows[0]['name'],160)
+                                d['choices_color']=list(dict.fromkeys(r['color'] for r in rows))[:24]
+                                target=identity(url)[1]
+                                selected=list(dict.fromkeys(r['color'] for r in rows if r['color_id']==target))
+                                if len(selected)==1: d['picked']=selected
+                                self.db.draft(user,'color',d);return self.options(chat,user,'color',d)
+                        except (OSError,ValueError,LookupError,RecursionError) as e:
+                            if isinstance(e,urllib.error.HTTPError) and e.code in (401,403,429): self.db.put('store_pause_until',now+3600)
+                d['name']=clean(title,160) if title and len(title)<=160 else fallback_name(url,store)
+                self.db.draft(user,'unverified',d); return self.render(chat,'Ürün bilgileri alınamadı.\n\n'+d['name'],keyboard([button('Yeniden dene','retrylink')],[button('Elle kaydet','manualadd')],home()))
+            if step=='name':
+                d['name']=clean(text);self.db.draft(user,'color',d);return self.options(chat,user,'color',d)
+            if step in ('color','size'): return self.finish_pick(chat,user,step,d,split_values(text))
+            self.menu(chat)
+        except ValueError as e: self.render(chat,str(e))
+        except sqlite3.IntegrityError: self.render(chat,'Bu ürün, renk ve beden zaten kayıtlı.')
+    def handle(self,u):
+        q=u.get('callback_query'); m=q.get('message') if q else u.get('message')
+        if not m or m.get('chat',{}).get('type')!='private': return
+        actor=q.get('from',{}) if q else m.get('from',{}); user=actor.get('id');chat=m['chat']['id']
+        if not user or chat!=user: return
+        if q: self.tg.call('answerCallbackQuery',callback_query_id=q['id'])
+        owner=self.db.get('owner'); text=m.get('text','') if not q else ''
+        if not owner:
+            if q: return
+            if text.startswith('/baglan '):
+                # Global cooldown prevents rapid guessing before first binding.
+                now=int(time.time()); until=int(self.db.get('pair_until','0'))
+                if now<until: return self.render(chat,'Bir süre sonra yeniden dene.')
+                if not hmac.compare_digest(text[8:].strip().encode(),self.code.encode()):
+                    self.db.put('pair_until',now+10);return self.render(chat,'Eşleştirme başarısız.')
+                self.db.put('owner',user)
+                if m.get('message_id'):
+                    try: self.tg.call('deleteMessage',chat_id=chat,message_id=m['message_id'])
+                    except RuntimeError: pass
+                return self.menu(chat)
+            return self.render(chat,'Kurulum için /baglan KOD komutunu kullan.')
+        if str(user)!=owner: return
+        if q:
+            mid=m.get('message_id'); saved=self.db.get('screen_message')
+            if mid and saved and str(mid)!=saved: return
+            if mid and not saved: self.db.put('screen_message',mid)
+            return self.callback(chat,user,q.get('data',''))
+        if text: return self.message(chat,user,text)
+
+def main():
+    load_env(); token=(os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_TOKEN') or os.getenv('TOKEN') or '').strip();code=os.getenv('PAIR_CODE','').strip()
+    if not re.fullmatch(r'\d+:[A-Za-z0-9_-]{20,}',token) or len(code)<12: raise SystemExit('BOT_TOKEN ve en az 12 karakterli PAIR_CODE gerekli.')
+    data=Path(os.getenv('DATA_DIR') or ('/data/avail' if Path('/data').is_dir() and os.access('/data',os.W_OK) else 'data'));data.mkdir(parents=True,exist_ok=True)
+    legacy=Path('data/shopping.sqlite3'); target=data/'shopping.sqlite3'
+    if not target.exists() and legacy.exists() and legacy.resolve()!=target.resolve():
+        with sqlite3.connect(legacy) as src, sqlite3.connect(target) as dst: src.backup(dst)
+    db=DB(data/'shopping.sqlite3');tg=Telegram(token);bot=Bot(db,tg,code)
+    tg.call('getMe');tg.call('deleteWebhook',drop_pending_updates=False)
+    try:
+        tg.call('setMyCommands',commands=[{'command':'menu','description':'Ana menü'},{'command':'ekle','description':'Ürün ekle'},{'command':'urunler','description':'Takip listesi'}])
+    except RuntimeError: LOG.warning('Komut menüsü ayarlanamadı.')
+    LOG.info('Bot başladı v%s; deneysel bağlantı.',VERSION)
+    delay=1
+    while True:
+        try:
+            bot.engine.tick(); bot.engine.deliver(tg)
+            updates=tg.call('getUpdates',offset=int(db.get('offset','0')),timeout=10,allowed_updates=['message','callback_query'])
+            for u in updates:
+                try: bot.handle(u)
+                except TelegramError as e:
+                    if e.code not in (400,403): raise
+                    LOG.warning('Güncelleme işlenemedi: %s',e.diagnostic())
+                except (ValueError,IndexError,KeyError,sqlite3.Error) as e: LOG.warning('Güncelleme hatası: %s',type(e).__name__)
+                db.put('offset',u['update_id']+1)
+            delay=1
+        except (RuntimeError,OSError,sqlite3.Error) as e:
+            LOG.warning('Yeniden denenecek: %s',e.diagnostic() if isinstance(e,TelegramError) else (str(e) if type(e) is RuntimeError and str(e).startswith(('getUpdates:','sendMessage:','editMessageText:','answerCallbackQuery:','deleteMessage:','editMessageReplyMarkup:')) else type(e).__name__))
+            time.sleep(delay);delay=min(delay*2,60)
+
+if __name__=='__main__':
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s');main()
