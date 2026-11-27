@@ -1,11 +1,6 @@
 name: avail - connection test
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - connection_test.py
-      - .github/workflows/connection.yml
 permissions:
   contents: read
 concurrency:
