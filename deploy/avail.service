@@ -1,0 +1,26 @@
+[Unit]
+Description=avail personal Telegram tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=avail
+Group=avail
+WorkingDirectory=/opt/avail/legacy
+EnvironmentFile=/etc/avail/avail.env
+Environment=DATA_DIR=/var/lib/avail
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/avail/legacy/main.py
+Restart=on-failure
+RestartSec=15
+StateDirectory=avail
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
